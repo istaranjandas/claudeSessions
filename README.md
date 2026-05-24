@@ -1,6 +1,6 @@
 # Claude Sessions
 
-A private, in-browser dashboard for your Claude Code transcripts. Pick your `.claude/projects` folder and browse every session, prompt, reply, and tool call — with search, stats, and timelines.
+A private, in-browser dashboard for your Claude Code transcripts. Pick your `.claude` folder and browse every session, prompt, reply, and tool call — with search, stats, and timelines.
 
 **Nothing is uploaded.** Files are read directly by your browser via the File System Access API (or `<input webkitdirectory>` on Firefox/Safari). Close the tab and the data is gone.
 
