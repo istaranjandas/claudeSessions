@@ -1,4 +1,4 @@
-# 🌟 Claude Sessions
+# 🌟 Claude Dashboard
 
 A gorgeous, private, **fully in-browser dashboard** for your Claude Code transcripts. Simply pick your local `.claude` (or `.claude/projects`) folder to instantly browse every session, prompt, reply, tool call, and timeline — all with rich analytics, fast fuzzy search, and keyboard navigation.
 

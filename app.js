@@ -1265,7 +1265,7 @@ const App = (() => {
       <section class="landing fade-in">
         <div class="landing-hero">
           <div class="landing-mark"></div>
-          <div class="eyebrow">Claude Sessions</div>
+          <div class="eyebrow">Claude Dashboard</div>
           <h1 class="h-mega">Every prompt, reply,<br>and tool call —<br><span class="grad">visualised</span>.</h1>
           <p class="sub">A private, in-browser dashboard for your Claude Code transcripts. Pick your <span class="mono">.claude</span> folder for full stats — or just <span class="mono">.claude/projects</span> for the basics.</p>
 
