@@ -235,6 +235,7 @@ const Indexer = (() => {
     const durationBuckets = {};
     const globalFiles = {};
     const dailyTokens = {};
+    const dailyModelTokens = {};
     const grandTokens = { input: 0, output: 0, cache_create: 0, cache_read: 0, total: 0 };
     const sessionsById = new Map();
     const total = entries.length;
@@ -281,9 +282,15 @@ const Indexer = (() => {
         }
         const u = full.usage || {};
         for (const k of Object.keys(grandTokens)) grandTokens[k] += Number(u[k]) || 0;
+        const sessModel = meta.model || "unknown";
         for (const [day, parts] of Object.entries(full.usage_by_day || {})) {
           if (!dailyTokens[day]) dailyTokens[day] = { input: 0, output: 0, cache_create: 0, cache_read: 0 };
           for (const k of Object.keys(dailyTokens[day])) dailyTokens[day][k] += Number(parts[k]) || 0;
+          const dayTotal = (Number(parts.input) || 0) + (Number(parts.output) || 0) + (Number(parts.cache_create) || 0) + (Number(parts.cache_read) || 0);
+          if (dayTotal) {
+            if (!dailyModelTokens[day]) dailyModelTokens[day] = {};
+            dailyModelTokens[day][sessModel] = (dailyModelTokens[day][sessModel] || 0) + dayTotal;
+          }
         }
       }
       if (!sessionsMeta.length) continue;
@@ -323,6 +330,9 @@ const Indexer = (() => {
         top_files: Object.entries(globalFiles).sort((a, b) => b[1] - a[1]).slice(0, 25),
         tokens_total: grandTokens,
         daily_tokens: Object.entries(dailyTokens).sort(),
+        dailyModelTokens: Object.entries(dailyModelTokens)
+          .sort(([a], [b]) => a.localeCompare(b))
+          .map(([date, tokensByModel]) => ({ date, tokensByModel })),
       },
     };
 
@@ -347,10 +357,6 @@ const Picker = (() => {
       isClaudeRoot = true;
     } catch {}
     if (isClaudeRoot) {
-      try {
-        const fh = await rootHandle.getFileHandle("stats-cache.json");
-        entries.push({ role: "stats-cache", getFile: () => fh.getFile() });
-      } catch {}
       try {
         const fh = await rootHandle.getFileHandle("history.jsonl");
         entries.push({ role: "history", getFile: () => fh.getFile() });
@@ -390,10 +396,6 @@ const Picker = (() => {
         const files = Array.from(input.files || []);
         const entries = [];
         for (const f of files) {
-          if (f.name === "stats-cache.json") {
-            entries.push({ role: "stats-cache", getFile: () => Promise.resolve(f) });
-            continue;
-          }
           if (f.name === "history.jsonl") {
             entries.push({ role: "history", getFile: () => Promise.resolve(f) });
             continue;
@@ -536,7 +538,6 @@ const IndexerClient = (() => {
             manifest: e.data.manifest,
             sessionsById,
             history: e.data.history || [],
-            cacheHits: e.data.cacheHits || 0,
           });
         } else if (type === "error") {
           w.removeEventListener("message", handler);
@@ -550,16 +551,14 @@ const IndexerClient = (() => {
             w.postMessage({ type: "index-handle", payload: { handle: input.handle } });
           } else if (input.entries && input.entries.length) {
             const sessions = [];
-            let statsCache = null;
             let history = null;
             for (const en of input.entries) {
               const f = await en.getFile();
-              if (en.role === "stats-cache" || f.name === "stats-cache.json") { statsCache = f; continue; }
               if (en.role === "history" || f.name === "history.jsonl") { history = f; continue; }
               if (!en.slug || !en.sessionId) continue;
               sessions.push({ slug: en.slug, sessionId: en.sessionId, file: f });
             }
-            w.postMessage({ type: "index-files", payload: { sessions, statsCache, history } });
+            w.postMessage({ type: "index-files", payload: { sessions, history } });
           } else {
             throw new Error("nothing to index");
           }
@@ -575,8 +574,8 @@ const IndexerClient = (() => {
   async function buildOnMain(input, onProgress) {
     let entries = input.handle ? await Picker.collectFromHandle(input.handle) : input.entries;
     entries = (entries || []).filter(e => e.slug && e.sessionId);
-    const result = await Indexer.build(entries, p => onProgress && onProgress({ ...p, cacheHits: 0 }));
-    return { ...result, history: [], cacheHits: 0 };
+    const result = await Indexer.build(entries, p => onProgress && onProgress(p));
+    return { ...result, history: [] };
   }
 
   async function build(input, onProgress) {
@@ -590,28 +589,5 @@ const IndexerClient = (() => {
     return buildOnMain(input, onProgress);
   }
 
-  async function clearCache() {
-    const w = getWorker();
-    if (!w) {
-      try {
-        await new Promise((resolve) => {
-          const req = indexedDB.deleteDatabase("claude-sessions-cache");
-          req.onsuccess = req.onerror = req.onblocked = resolve;
-        });
-      } catch {}
-      return;
-    }
-    return new Promise((resolve) => {
-      const handler = (e) => {
-        if (e.data.type === "cache-cleared") {
-          w.removeEventListener("message", handler);
-          resolve();
-        }
-      };
-      w.addEventListener("message", handler);
-      w.postMessage({ type: "clear-cache" });
-    });
-  }
-
-  return { build, clearCache };
+  return { build };
 })();

@@ -235,6 +235,7 @@ function buildManifest(results) {
   const durationBuckets = {};
   const globalFiles = {};
   const dailyTokens = {};
+  const dailyModelTokens = {};
   const grandTokens = { input: 0, output: 0, cache_create: 0, cache_read: 0, total: 0 };
   const sessionsById = new Map();
 
@@ -263,9 +264,15 @@ function buildManifest(results) {
       }
       const u = full.usage || {};
       for (const k of Object.keys(grandTokens)) grandTokens[k] += Number(u[k]) || 0;
+      const sessModel = meta.model || "unknown";
       for (const [day, parts] of Object.entries(full.usage_by_day || {})) {
         if (!dailyTokens[day]) dailyTokens[day] = { input: 0, output: 0, cache_create: 0, cache_read: 0 };
         for (const k of Object.keys(dailyTokens[day])) dailyTokens[day][k] += Number(parts[k]) || 0;
+        const dayTotal = (Number(parts.input) || 0) + (Number(parts.output) || 0) + (Number(parts.cache_create) || 0) + (Number(parts.cache_read) || 0);
+        if (dayTotal) {
+          if (!dailyModelTokens[day]) dailyModelTokens[day] = {};
+          dailyModelTokens[day][sessModel] = (dailyModelTokens[day][sessModel] || 0) + dayTotal;
+        }
       }
     }
     if (!sessionsMeta.length) continue;
@@ -305,134 +312,53 @@ function buildManifest(results) {
       top_files: Object.entries(globalFiles).sort((a, b) => b[1] - a[1]).slice(0, 25),
       tokens_total: grandTokens,
       daily_tokens: Object.entries(dailyTokens).sort(),
+      dailyModelTokens: Object.entries(dailyModelTokens)
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([date, tokensByModel]) => ({ date, tokensByModel })),
     },
   };
   return { manifest, sessionsById };
 }
 
-const CACHE_DB = "claude-sessions-cache";
-const CACHE_STORE = "sessions";
-const CACHE_VERSION = 1;
-let _cacheDB = null;
-
-function openCacheDB() {
-  if (_cacheDB) return Promise.resolve(_cacheDB);
-  return new Promise((resolve, reject) => {
-    const req = indexedDB.open(CACHE_DB, CACHE_VERSION);
-    req.onupgradeneeded = () => {
-      const db = req.result;
-      if (!db.objectStoreNames.contains(CACHE_STORE)) db.createObjectStore(CACHE_STORE);
-    };
-    req.onsuccess = () => { _cacheDB = req.result; resolve(_cacheDB); };
-    req.onerror = () => reject(req.error);
-  });
-}
-
-async function cacheGet(key) {
-  try {
-    const db = await openCacheDB();
-    return await new Promise((resolve) => {
-      const tx = db.transaction(CACHE_STORE, "readonly");
-      const req = tx.objectStore(CACHE_STORE).get(key);
-      req.onsuccess = () => resolve(req.result || null);
-      req.onerror = () => resolve(null);
-    });
-  } catch { return null; }
-}
-
-async function cachePut(key, val) {
-  try {
-    const db = await openCacheDB();
-    await new Promise((resolve) => {
-      const tx = db.transaction(CACHE_STORE, "readwrite");
-      tx.objectStore(CACHE_STORE).put(val, key);
-      tx.oncomplete = resolve;
-      tx.onerror = resolve;
-    });
-  } catch {}
-}
-
-async function cachePruneExcept(keepKeys) {
-  try {
-    const db = await openCacheDB();
-    const keep = new Set(keepKeys);
-    return await new Promise((resolve) => {
-      const tx = db.transaction(CACHE_STORE, "readwrite");
-      const store = tx.objectStore(CACHE_STORE);
-      const req = store.openKeyCursor();
-      let removed = 0;
-      req.onsuccess = (e) => {
-        const cur = e.target.result;
-        if (!cur) { resolve(removed); return; }
-        if (!keep.has(cur.key)) { store.delete(cur.key); removed++; }
-        cur.continue();
-      };
-      req.onerror = () => resolve(0);
-    });
-  } catch { return 0; }
-}
-
 async function indexAll(entries, getFile) {
   const total = entries.length;
   const parsed = [];
-  const usedKeys = [];
   let processed = 0;
-  let cacheHits = 0;
 
   for (const entry of entries) {
     let file;
     try { file = await getFile(entry); } catch { processed++; continue; }
-    const key = `${entry.slug}/${entry.sessionId}:${file.size}:${file.lastModified}`;
-    usedKeys.push(key);
-    let result = await cacheGet(key);
-    if (result) {
-      cacheHits++;
-    } else {
-      let text;
-      try { text = await file.text(); } catch { processed++; continue; }
-      result = indexSession(text, entry.sessionId, entry.slug);
-      if (result) await cachePut(key, result);
-    }
+    let text;
+    try { text = await file.text(); } catch { processed++; continue; }
+    const result = indexSession(text, entry.sessionId, entry.slug);
     if (result) parsed.push(result);
     processed++;
     if (processed % 3 === 0 || processed === total) {
-      self.postMessage({ type: "progress", processed, total, cacheHits });
+      self.postMessage({ type: "progress", processed, total });
       await new Promise(r => setTimeout(r, 0));
     }
   }
-
-  cachePruneExcept(usedKeys);
-  return { parsed, cacheHits };
+  return { parsed };
 }
 
-function parseExtras(statsText, historyText) {
-  const out = { dailyActivity: null, dailyModelTokens: null, history: null };
-  if (statsText) {
+function parseHistory(historyText) {
+  if (!historyText) return [];
+  const entries = [];
+  for (const line of historyText.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
     try {
-      const data = JSON.parse(statsText);
-      if (Array.isArray(data.dailyActivity)) out.dailyActivity = data.dailyActivity;
-      if (Array.isArray(data.dailyModelTokens)) out.dailyModelTokens = data.dailyModelTokens;
+      const e = JSON.parse(trimmed);
+      entries.push({
+        display: e.display || "",
+        timestamp: Number(e.timestamp) || 0,
+        project: e.project || "",
+        sessionId: e.sessionId || "",
+        pasted: e.pastedContents && Object.keys(e.pastedContents).length > 0,
+      });
     } catch {}
   }
-  if (historyText) {
-    const entries = [];
-    for (const line of historyText.split("\n")) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      try {
-        const e = JSON.parse(trimmed);
-        entries.push({
-          display: e.display || "",
-          timestamp: Number(e.timestamp) || 0,
-          project: e.project || "",
-          sessionId: e.sessionId || "",
-          pasted: e.pastedContents && Object.keys(e.pastedContents).length > 0,
-        });
-      } catch {}
-    }
-    out.history = entries;
-  }
-  return out;
+  return entries;
 }
 
 async function tryReadFileText(rootHandle, name) {
@@ -447,23 +373,8 @@ self.onmessage = async (e) => {
   try {
     const { type, payload } = e.data || {};
 
-    if (type === "clear-cache") {
-      try {
-        const db = await openCacheDB();
-        await new Promise((resolve) => {
-          const tx = db.transaction(CACHE_STORE, "readwrite");
-          tx.objectStore(CACHE_STORE).clear();
-          tx.oncomplete = resolve;
-          tx.onerror = resolve;
-        });
-      } catch {}
-      self.postMessage({ type: "cache-cleared" });
-      return;
-    }
-
     let entries = [];
     let getFile;
-    let statsText = null;
     let historyText = null;
 
     if (type === "index-handle") {
@@ -471,7 +382,6 @@ self.onmessage = async (e) => {
       let projHandle = rootHandle;
       try {
         projHandle = await rootHandle.getDirectoryHandle("projects");
-        statsText = await tryReadFileText(rootHandle, "stats-cache.json");
         historyText = await tryReadFileText(rootHandle, "history.jsonl");
       } catch {}
       for await (const [name, child] of projHandle.entries()) {
@@ -484,35 +394,29 @@ self.onmessage = async (e) => {
       getFile = (en) => en.fileHandle.getFile();
     } else if (type === "index-files") {
       entries = payload.sessions || [];
-      if (payload.statsCache) { try { statsText = await payload.statsCache.text(); } catch {} }
       if (payload.history) { try { historyText = await payload.history.text(); } catch {} }
       getFile = (en) => Promise.resolve(en.file);
     } else {
       throw new Error("Unknown message type: " + type);
     }
 
-    const extras = parseExtras(statsText, historyText);
+    const history = parseHistory(historyText);
 
     if (!entries.length) {
       const { manifest } = buildManifest([]);
-      if (extras.dailyActivity) manifest.stats.dailyActivity = extras.dailyActivity;
-      if (extras.dailyModelTokens) manifest.stats.dailyModelTokens = extras.dailyModelTokens;
-      self.postMessage({ type: "done", manifest, sessionsById: {}, history: extras.history || [], cacheHits: 0 });
+      self.postMessage({ type: "done", manifest, sessionsById: {}, history });
       return;
     }
 
-    const { parsed, cacheHits } = await indexAll(entries, getFile);
+    const { parsed } = await indexAll(entries, getFile);
     const { manifest, sessionsById } = buildManifest(parsed);
-    if (extras.dailyActivity) manifest.stats.dailyActivity = extras.dailyActivity;
-    if (extras.dailyModelTokens) manifest.stats.dailyModelTokens = extras.dailyModelTokens;
     const sessionsObj = {};
     for (const [k, v] of sessionsById) sessionsObj[k] = v;
     self.postMessage({
       type: "done",
       manifest,
       sessionsById: sessionsObj,
-      history: extras.history || [],
-      cacheHits,
+      history,
     });
   } catch (err) {
     self.postMessage({ type: "error", message: String(err?.message || err) });

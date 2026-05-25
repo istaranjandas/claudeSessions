@@ -40,6 +40,9 @@
       <button id="shortcuts-btn" class="btn btn-sm" title="Keyboard shortcuts (?)">
         <span class="kbd" style="margin:0">?</span>
       </button>
+      <button id="refresh-data-btn" class="btn btn-sm hidden" title="Refresh — rescan folder for new sessions">
+        <span style="font-size:14px;line-height:1">↻</span><span class="hidden sm:inline">Refresh</span>
+      </button>
       <button id="refresh-btn" class="btn btn-sm" title="Open folder">
         <span style="font-size:14px;line-height:1">⌂</span><span class="hidden sm:inline">Open folder</span>
       </button>
@@ -53,6 +56,13 @@
 <script src="app.js"></script>
 <script>
 if ("serviceWorker" in navigator) {
+  let _swReloaded = false;
+  navigator.serviceWorker.addEventListener("message", (event) => {
+    if (event.data && event.data.type === "sw-updated" && !_swReloaded) {
+      _swReloaded = true;
+      location.reload();
+    }
+  });
   window.addEventListener("load", () => {
     navigator.serviceWorker.register("sw.js").catch(() => {});
   });

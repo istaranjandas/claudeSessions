@@ -11,6 +11,8 @@ const App = (() => {
     history: null,
     historyView: { q: "", proj: "" },
     searchIndex: null,
+    lastRefreshAt: null,
+    refreshing: false,
   };
 
   const fmtDate = (iso) => {
@@ -257,29 +259,12 @@ const App = (() => {
             <div class="shortcut-row"><span class="label">Show this overlay</span><span class="keys"><span class="kbd">?</span></span></div>
             <div class="shortcut-row"><span class="label">Close overlay / blur field</span><span class="keys"><span class="kbd">Esc</span></span></div>
           </div>
-          <div class="flex items-center justify-between gap-3 mt-5 pt-4" style="border-top:1px solid var(--border)">
-            <p class="text-xs" style="color:var(--text-mute)">Cache stored locally in IndexedDB.</p>
-            <button id="clear-cache-btn" class="btn btn-sm">Clear cache</button>
-          </div>
         </div>
       </div>
     `;
     const close = () => { root.innerHTML = ""; };
     root.querySelector(".modal-close").addEventListener("click", close);
     root.querySelector(".modal-backdrop").addEventListener("click", e => { if (e.target.classList.contains("modal-backdrop")) close(); });
-    root.querySelector("#clear-cache-btn").addEventListener("click", async (e) => {
-      const btn = e.currentTarget;
-      btn.disabled = true;
-      btn.textContent = "Clearing…";
-      try {
-        await IndexerClient.clearCache();
-        btn.textContent = "Cleared ✓";
-        toast("Cache cleared — next index will re-parse everything");
-        setTimeout(close, 800);
-      } catch {
-        btn.textContent = "Failed";
-      }
-    });
   }
 
   function closeShortcutsModal() {
@@ -300,12 +285,118 @@ const App = (() => {
     if (meta) meta.classList.toggle("hidden", !loaded);
     const search = $("#search-shortcut");
     if (search) search.classList.toggle("hidden", !loaded);
+    const refreshBtn = $("#refresh-data-btn");
+    if (refreshBtn) refreshBtn.classList.toggle("hidden", !loaded || !state.pickerHandle);
     const btn = $("#refresh-btn");
     if (btn) {
       btn.innerHTML = loaded
-        ? `<span style="font-size:14px;line-height:1">↺</span><span class="hidden sm:inline">Switch folder</span>`
+        ? `<span style="font-size:14px;line-height:1">⇄</span><span class="hidden sm:inline">Switch folder</span>`
         : `<span style="font-size:14px;line-height:1">⌂</span><span class="hidden sm:inline">Open folder</span>`;
       btn.title = loaded ? "Pick a different folder" : "Choose your .claude/projects folder";
+    }
+  }
+
+  function freshnessLabel(at) {
+    if (!at) return "";
+    const sec = Math.max(0, Math.floor((Date.now() - at) / 1000));
+    if (sec < 5) return "just now";
+    if (sec < 60) return `${sec}s ago`;
+    if (sec < 3600) return `${Math.floor(sec / 60)}m ago`;
+    return `${Math.floor(sec / 3600)}h ago`;
+  }
+
+  function updateManifestMeta() {
+    const meta = $("#manifest-meta");
+    if (!meta || !state.manifest) return;
+    const base = `${state.manifest.session_count} sessions · ${state.manifest.project_count} projects`;
+    const folder = state.pickerHandle?.name ? ` · ${state.pickerHandle.name}` : "";
+    const fresh = state.lastRefreshAt ? ` · fresh ${freshnessLabel(state.lastRefreshAt)}` : "";
+    const busy = state.refreshing ? " · refreshing…" : "";
+    meta.textContent = base + folder + fresh + busy;
+    meta.title = `Folder handle: ${state.pickerHandle?.name || "(no handle)"} · last indexed ${state.lastRefreshAt ? new Date(state.lastRefreshAt).toLocaleString() : "never"}`;
+  }
+
+  async function refreshIndex({ silent = false } = {}) {
+    if (state.refreshing) {
+      console.warn("[refresh] already in progress — ignoring click");
+      if (!silent) toast("Refresh already in progress");
+      return;
+    }
+    console.group(`[refresh] start (silent=${silent})`);
+    console.log("handle:", state.pickerHandle?.name || "(none)", state.pickerHandle);
+    if (!state.pickerHandle) {
+      console.warn("[refresh] no handle");
+      console.groupEnd();
+      if (!silent) toast("Refresh needs the original folder handle. Use Switch folder to reopen it.");
+      return;
+    }
+    if (Picker.HAS_FS_ACCESS) {
+      const ok = await Picker.ensurePermission(state.pickerHandle, !silent);
+      console.log("[refresh] permission granted:", ok);
+      if (!ok) {
+        console.warn("[refresh] permission denied");
+        console.groupEnd();
+        if (!silent) toast("Folder permission was revoked. Switch folder to reopen.");
+        return;
+      }
+    }
+    state.refreshing = true;
+    updateManifestMeta();
+    const btn = $("#refresh-data-btn");
+    if (btn) btn.disabled = true;
+    const scrollY = window.scrollY;
+    const oldCount = state.manifest?.session_count || 0;
+    try {
+      const entries = await Picker.collectFromHandle(state.pickerHandle);
+      console.log("[refresh] entries collected:", entries.length);
+      if (!entries.length) {
+        if (!silent) toast("No sessions found in folder");
+        return;
+      }
+      if (!silent) renderIndexingProgress(0, entries.length);
+      const result = await IndexerClient.build(
+        { handle: state.pickerHandle, entries },
+        ({ processed, total }) => {
+          if (!silent) renderIndexingProgress(processed, total);
+        }
+      );
+      console.log("[refresh] build result:", result.manifest.session_count, "sessions,", result.manifest.project_count, "projects");
+      if (!result.manifest.session_count) {
+        if (!silent) toast("Folder has no readable sessions");
+        return;
+      }
+      const sig = (m) => m
+        ? `${m.session_count}:${(m.projects || []).reduce((a, p) => a + (p.total_messages || 0), 0)}:${(m.projects || []).map(p => p.last_active || "").sort().pop() || ""}`
+        : "";
+      const oldSig = sig(state.manifest);
+      const newSig = sig(result.manifest);
+      const changed = oldSig !== newSig;
+      console.log("[refresh] sig old=", oldSig, "new=", newSig, "changed=", changed);
+      state.manifest = result.manifest;
+      state.sessionsById = result.sessionsById;
+      state.history = result.history || [];
+      state.searchIndex = null;
+      setTimeout(() => { state.searchIndex = buildSearchIndex(result.sessionsById); }, 50);
+      state.lastRefreshAt = Date.now();
+      if (changed || !silent) {
+        await route();
+        window.scrollTo({ top: scrollY, behavior: "instant" });
+      }
+      const newCount = result.manifest.session_count;
+      const diff = newCount - oldCount;
+      const msg = changed
+        ? `Refreshed · ${newCount} sessions${diff > 0 ? ` (+${diff} new)` : diff < 0 ? ` (${diff})` : ""}`
+        : `No new data · ${newCount} sessions`;
+      if (!silent) toast(msg);
+      console.log("[refresh] done:", msg);
+    } catch (e) {
+      console.error("[refresh] failed", e);
+      if (!silent) toast("Refresh failed: " + (e?.message || "unknown"));
+    } finally {
+      state.refreshing = false;
+      if (btn) btn.disabled = false;
+      updateManifestMeta();
+      console.groupEnd();
     }
   }
 
@@ -315,9 +406,9 @@ const App = (() => {
       renderLanding();
       return;
     }
-    renderIndexingProgress(0, entries.length, 0);
-    const result = await IndexerClient.build({ handle, entries }, ({ processed, total, cacheHits }) => {
-      renderIndexingProgress(processed, total, cacheHits || 0);
+    renderIndexingProgress(0, entries.length);
+    const result = await IndexerClient.build({ handle, entries }, ({ processed, total }) => {
+      renderIndexingProgress(processed, total);
     });
     if (!result.manifest.session_count) {
       toast("That folder had no readable sessions");
@@ -333,8 +424,8 @@ const App = (() => {
       state.pickerHandle = handle;
       await Picker.saveHandle(handle);
     }
-    const meta = $("#manifest-meta");
-    if (meta) meta.textContent = `${result.manifest.session_count} sessions · ${result.manifest.project_count} projects`;
+    state.lastRefreshAt = Date.now();
+    updateManifestMeta();
     updateHeaderControls(true);
     const target = state.pendingHash;
     state.pendingHash = null;
@@ -1279,7 +1370,7 @@ const App = (() => {
           <div class="landing-hint">
             <div><span class="kbd">~</span>/<span class="mono">.claude</span> &nbsp;·&nbsp; macOS &amp; Linux</div>
             <div><span class="mono">C:\\Users\\&lt;you&gt;\\.claude</span> &nbsp;·&nbsp; Windows</div>
-            <div style="margin-top:8px;font-size:11px">Picking the full <span class="mono">.claude</span> folder unlocks the History tab and per-model token charts (from <span class="mono">stats-cache.json</span>).</div>
+            <div style="margin-top:8px;font-size:11px">Picking the full <span class="mono">.claude</span> folder unlocks the History tab (from <span class="mono">history.jsonl</span>).</div>
           </div>
         </div>
 
@@ -1374,10 +1465,6 @@ const App = (() => {
   function walkEntry(entry, prefix, out) {
     return new Promise((resolve) => {
       if (entry.isFile) {
-        if (entry.name === "stats-cache.json") {
-          entry.file(f => { out.push({ role: "stats-cache", getFile: () => Promise.resolve(f) }); resolve(); }, () => resolve());
-          return;
-        }
         if (entry.name === "history.jsonl") {
           entry.file(f => { out.push({ role: "history", getFile: () => Promise.resolve(f) }); resolve(); }, () => resolve());
           return;
@@ -1413,7 +1500,7 @@ const App = (() => {
     });
   }
 
-  function renderIndexingProgress(done, total, cacheHits) {
+  function renderIndexingProgress(done, total) {
     const pct = total ? Math.round((done / total) * 100) : 0;
     if (!$("#indexing-view")) {
       app.innerHTML = `
@@ -1423,19 +1510,15 @@ const App = (() => {
             <h1 class="h-mega" style="font-size:36px">Indexing sessions…</h1>
             <p class="sub" id="indexing-status" style="font-size:14px">Reading files</p>
             <div class="progress-bar mt-5"><span id="indexing-bar" style="width:0%"></span></div>
-            <p class="text-xs mt-3" id="indexing-cache" style="color:var(--text-mute)">Processing in a Web Worker · cached results re-used when files are unchanged</p>
+            <p class="text-xs mt-3" style="color:var(--text-mute)">Reading every session fresh from disk · no cache</p>
           </div>
         </section>
       `;
     }
     const bar = $("#indexing-bar");
     const status = $("#indexing-status");
-    const cache = $("#indexing-cache");
     if (bar) bar.style.width = pct + "%";
     if (status) status.textContent = `Indexed ${done.toLocaleString()} / ${total.toLocaleString()} sessions`;
-    if (cache && cacheHits != null && cacheHits > 0) {
-      cache.innerHTML = `<span style="color:var(--ok)">⚡ ${cacheHits.toLocaleString()} session${cacheHits === 1 ? "" : "s"} loaded from cache</span> · only changed files were re-parsed`;
-    }
   }
 
   function buildPromptHistory(m) {
@@ -1645,6 +1728,7 @@ const App = (() => {
   async function bootstrap() {
     updateHeaderControls(false);
     state.pendingHash = location.hash;
+    try { indexedDB.deleteDatabase("claude-sessions-cache"); } catch {}
     if (Picker.HAS_FS_ACCESS) {
       const stored = await Picker.loadHandle().catch(() => null);
       if (stored) {
@@ -1672,9 +1756,45 @@ const App = (() => {
       if (state.manifest) switchFolder();
       else openPicker();
     });
+    $("#refresh-data-btn")?.addEventListener("click", () => refreshIndex({ silent: false }));
     $("#search-shortcut")?.addEventListener("click", () => { location.hash = "#/search"; });
     $("#shortcuts-btn")?.addEventListener("click", openShortcutsModal);
     bindKeyboard();
     bootstrap();
+
+    let lastVisibleAt = Date.now();
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible") {
+        const away = Date.now() - lastVisibleAt;
+        if (state.manifest && state.pickerHandle && away > 15_000) {
+          refreshIndex({ silent: true });
+        }
+      } else {
+        lastVisibleAt = Date.now();
+      }
+    });
+
+    setInterval(() => {
+      if (document.visibilityState !== "visible") return;
+      if (!state.manifest || !state.pickerHandle) return;
+      refreshIndex({ silent: true });
+    }, 60_000);
+
+    setInterval(updateManifestMeta, 10_000);
   });
+
+  window._diag = {
+    state,
+    refreshIndex,
+    picker: () => Picker,
+    indexer: () => IndexerClient,
+    handle: () => state.pickerHandle,
+    clearHandle: async () => { await Picker.clearStoredHandle(); console.log("handle cleared — switch folder to repick"); },
+    listEntries: async () => {
+      if (!state.pickerHandle) { console.warn("no handle"); return []; }
+      const entries = await Picker.collectFromHandle(state.pickerHandle);
+      console.table(entries.map(e => ({ slug: e.slug, sessionId: e.sessionId, role: e.role || "" })));
+      return entries;
+    },
+  };
 })();

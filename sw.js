@@ -1,4 +1,4 @@
-const CACHE = "claude-sessions-v2";
+const CACHE = "claude-sessions-v6";
 const SHELL = [
   "./",
   "./index.html",
@@ -17,8 +17,10 @@ self.addEventListener("install", (event) => {
 self.addEventListener("activate", (event) => {
   event.waitUntil(
     caches.keys().then(keys => Promise.all(keys.filter(k => k !== CACHE).map(k => caches.delete(k))))
+      .then(() => self.clients.claim())
+      .then(() => self.clients.matchAll({ type: "window" }))
+      .then(clients => clients.forEach(c => c.postMessage({ type: "sw-updated", version: CACHE })))
   );
-  self.clients.claim();
 });
 
 self.addEventListener("fetch", (event) => {
@@ -27,15 +29,12 @@ self.addEventListener("fetch", (event) => {
   const url = new URL(req.url);
   if (url.origin !== location.origin) return;
   event.respondWith(
-    caches.match(req).then(cached => {
-      const network = fetch(req).then(res => {
-        if (res && res.ok) {
-          const clone = res.clone();
-          caches.open(CACHE).then(c => c.put(req, clone)).catch(() => {});
-        }
-        return res;
-      }).catch(() => cached);
-      return cached || network;
-    })
+    fetch(req).then(res => {
+      if (res && res.ok) {
+        const clone = res.clone();
+        caches.open(CACHE).then(c => c.put(req, clone)).catch(() => {});
+      }
+      return res;
+    }).catch(() => caches.match(req).then(c => c || Response.error()))
   );
 });

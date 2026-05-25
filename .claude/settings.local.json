@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(git ls-remote *)",
+      "PowerShell(git *)",
+      "PowerShell(git status --short; \"----\"; git diff --stat)",
+      "PowerShell(git checkout *)",
+      "PowerShell(Get-NetTCPConnection *)"
+    ]
+  }
+}
